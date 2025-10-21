@@ -67,8 +67,8 @@ def main():
     parser = ArgumentParser(description="Test the model with the shadowlinks dataset")
     parser.add_argument("--input_folder", type=str, default="demo_files/input_folder", help="The input folder where the dowloaded Wikipedia files are stored")
     parser.add_argument("--prompt_template", type=str, default="input_files/prompt_template_with_example.json", help="The prompt template to fill in the inputs.")
-    parser.add_argument("--target_entity_types", type=str, default="input_files/target_entity_types_4_adidas.json", help="The target entity types to extract from the Wikipedia files.")
-    parser.add_argument("--target_relations", type=str, default="input_files/target_relations_4_adidas.json", help="The target relations to extract from the Wikipedia files.")
+    parser.add_argument("--target_entity_types", type=str, default="demo_files/targets_demo1/entity_types__adidas.json", help="The target entity types to extract from the Wikipedia files.")
+    parser.add_argument("--target_relations", type=str, default="demo_files/targets_demo1/relations__adidas.json", help="The target relations to extract from the Wikipedia files.")
     parser.add_argument("--NER_example", type=str, default="input_files/NER_example.json", help="NER example to use in the prompt template.")
     parser.add_argument("--RE_example", type=str, default="input_files/RE_example.json", help="RE example to use in the prompt template.")
     parser.add_argument("--LLM", type=str, default="FinaPolat/phi4_adaptable_IE", help="The model to use for the test")
@@ -203,35 +203,82 @@ def main():
     start = time()
     tokenizer = AutoTokenizer.from_pretrained("FinaPolat/phi4_adaptable_IE")
     print(f"Tokenizer is loaded ({time() - start}s)")
-    if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})  # Add to tokenizer
+    # Avoid adding new tokens to prevent large embedding resize; reuse eos as pad later
     tokenizer.padding_side = "left"
-    model.resize_token_embeddings(len(tokenizer))
+
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = "mps"
+    
+    dtype = torch.float16 if device == "mps" else torch.float32
+    # Use correct dtype arg and force eager attention on MPS to avoid MPS matmul shape issues
+    model = AutoModelForCausalLM.from_pretrained(
+        "FinaPolat/phi4_adaptable_IE",
+        low_cpu_mem_usage=True,
+        dtype=dtype, # `torch_dtype` is deprecated! Use `dtype` instead!
+        attn_implementation="eager" if device == "mps" else None,
+    )
+    model.to(device)
+    model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained("FinaPolat/phi4_adaptable_IE")
+    # avoid adding new tokens; reuse eos as pad if needed
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model.config.pad_token_id = tokenizer.pad_token_id
+    tokenizer.padding_side = "left"
+
+    gen_max_new = min(args.max_tokens, 128)
+    input_max_length = 1024 if device == "mps" else 2048
 
     LLM_answers = []
-    for i in range(len(data)):
-        print(f"Generating answer for row {i}...", flush=True)
-        print(data[i]["text"], flush=True)
-        inputs = tokenizer(data[i]["text"], return_tensors="pt").to("cuda")
-        outputs = model.generate(input_ids=inputs["input_ids"], 
-                                 attention_mask=inputs["attention_mask"], 
-                                 max_new_tokens = args.max_tokens,
-                                 temperature=args.temperature,
-                                 do_sample=True)
-        prompt_length = inputs["input_ids"].shape[1]
-        generated_text = tokenizer.decode(outputs[0][prompt_length:], skip_special_tokens=True)
-        row = input_data[i]
-        LLM_answers.append({
-            "article": row["article"],
-            "heading": row["heading"],
-            "url": row["url"],
-            "input type": row["input type"],
-            "task": row["task"],
-            "schema": row["schema"],
-            "input text": row["input text"],
-            "prompt": row["prompt"],
-            "LLM answer": generated_text,
-        })
+    with torch.inference_mode():
+        for i in range(len(data)):
+            print(f"Generating answer for row {i}...", flush=True)
+            # avoid printing gigantic prompt; log just a preview
+            preview = data[i]["text"][:200].replace("\n", " ")
+            print(f"Prompt preview: {preview}...", flush=True)
+
+            inputs = tokenizer(
+                data[i]["text"],
+                return_tensors="pt",
+                truncation=True,
+                max_length=input_max_length
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=gen_max_new,
+                temperature=args.temperature,
+                do_sample=True,
+                use_cache=True
+            )
+
+            prompt_length = inputs["input_ids"].shape[1]
+            generated_text = tokenizer.decode(
+                outputs[0][prompt_length:], skip_special_tokens=True
+            )
+
+            row = input_data[i]
+            LLM_answers.append({
+                "article": row["article"],
+                "heading": row["heading"],
+                "url": row["url"],
+                "input type": row["input type"],
+                "task": row["task"],
+                "schema": row["schema"],
+                "input text": row["input text"],
+                "prompt": row["prompt"],
+                "LLM answer": generated_text,
+            })
+
+            # Free memory between iterations, important for MPS
+            del outputs, inputs
+            if device == "mps":
+                torch.mps.empty_cache()
 
     write_jsonl(LLM_answers, f"{args.output_folder}/LLM_answers.jsonl")
     write_json(args_dict, f"{args.output_folder}/args.json")

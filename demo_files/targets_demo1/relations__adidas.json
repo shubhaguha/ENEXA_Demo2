@@ -1,0 +1,9 @@
+[
+  {
+    "category": "Business",
+    "relations": [{"part_of": {"domain": "Organization", "range": "Organization"}},
+                  {"parent_company_of": {"domain": "Organization", "range": "Organization"}},
+                  {"subsidiary_of": {"domain": "Organization", "range": "Organization"}}
+                ]
+  }
+]
